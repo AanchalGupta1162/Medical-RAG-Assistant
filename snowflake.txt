@@ -1,0 +1,73 @@
+create database MEDICAL_DATA;
+
+create schema DATA;
+
+create or replace stage medical_data_stage ENCRYPTION = (TYPE = 'SNOWFLAKE_SSE') DIRECTORY = ( ENABLE = true );
+
+CREATE OR REPLACE FUNCTION MEDICAL_DATA.DATA.TEXT_CHUNKER("PDF_TEXT" VARCHAR(16777216))
+RETURNS TABLE ("CHUNK" VARCHAR(16777216))
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.9'
+PACKAGES = ('snowflake-snowpark-python','langchain')
+HANDLER = 'text_chunker'
+AS '
+from snowflake.snowpark.types import StringType, StructField, StructType
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+import pandas as pd
+
+class text_chunker:
+
+    def process(self, pdf_text: str):
+        
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size = 1512, #Adjust this as you see fit
+            chunk_overlap  = 256, #This let''s text have some form of overlap. Useful for keeping chunks contextual
+            length_function = len
+        )
+    
+        chunks = text_splitter.split_text(pdf_text)
+        df = pd.DataFrame(chunks, columns=[''chunks''])
+        
+        yield from df.itertuples(index=False, name=None)
+';
+
+CREATE or replace TABLE medical_docs_chunks (
+    doc_id STRING,                  -- Document ID or name
+    relative_path STRING,           -- Path of the file in the stage
+    size NUMBER,                    -- Size of the file
+    file_url STRING,                -- Original file URL
+    scoped_file_url STRING,         -- Scoped URL for the file
+    page_number INT,                -- Page number for context
+    chunk_number INT,               -- Chunk index within a page
+    chunk TEXT                      -- The extracted text chunk
+);
+
+INSERT INTO medical_docs_chunks (doc_id, relative_path, size, file_url, 
+                                 scoped_file_url,chunk)
+SELECT 
+    relative_path AS doc_id,      -- Use relative path as the document ID
+    relative_path, 
+    size,
+    file_url, 
+    build_scoped_file_url(@medical_data_stage, relative_path) AS scoped_file_url,
+    func.chunk AS chunk                -- Text chunk
+FROM 
+    directory(@medical_data_stage),    -- Reads files from the specified stage
+    TABLE(text_chunker(
+        TO_VARCHAR(SNOWFLAKE.CORTEX.PARSE_DOCUMENT(@medical_data_stage, 
+        relative_path, {'mode': 'LAYOUT'}))
+    )) AS func;
+
+
+    CREATE OR REPLACE CORTEX SEARCH SERVICE CC_MEDICAL_DOC_SEARCH_SERVICE
+ON chunk
+ATTRIBUTES doc_id, relative_path, chunk
+WAREHOUSE = COMPUTE_WH
+TARGET_LAG = '1 minute'
+AS (
+    SELECT doc_id,               -- Document ID or name
+           relative_path,        -- Path of the file in the stage
+           chunk,                -- Extracted text chunk (searchable content)
+           file_url              -- Original file URL (for referencing the document)
+    FROM medical_docs_chunks    -- Table containing the document chunks
+);
